@@ -1,0 +1,5 @@
+# 编译产物和本地临时文件；syso 原生资源保留以便直接 go build。
+*.exe
+*.test
+*.log
+work/
