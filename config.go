@@ -10,8 +10,20 @@ import (
 
 // Config 是持久化设置；空设备 ID 表示跟随 Windows 默认通信麦克风。
 type Config struct {
-	DeviceID string `json:"device_id"` // Windows 录音端点 ID，避免同名设备选错。
-	Hotkey   string `json:"hotkey"`    // 按住发言的按键或组合键，例如 F8、Ctrl+Space。
+	DeviceID           string `json:"device_id"`           // Windows 录音端点 ID，避免同名设备选错。
+	Hotkey             string `json:"hotkey"`              // 按住发言的按键或组合键，例如 F8、Ctrl+Space。
+	EnhancementPercent int    `json:"enhancement_percent"` // 相对原始音量的增强比例，100 表示不增强，最大 200。
+}
+
+// normalizeEnhancement 兼容旧配置中缺失的增强设置，并拒绝超出滑动条范围的数值。
+func normalizeEnhancement(percent int) (int, error) {
+	if percent == 0 {
+		return 100, nil
+	}
+	if percent < 100 || percent > 200 {
+		return 100, fmt.Errorf("麦克风增强必须在 100%%～200%% 之间")
+	}
+	return percent, nil
 }
 
 // configPath 将设置保存在当前用户目录，程序移动后仍可继续使用。
@@ -25,7 +37,8 @@ func configPath() (string, error) {
 
 // loadConfig 首次启动使用 F8；损坏的配置交给界面明确提示。
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Hotkey: "F8"}
+	defaults := Config{Hotkey: "F8", EnhancementPercent: 100}
+	cfg := defaults
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return cfg, nil
@@ -34,13 +47,16 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	if err = json.Unmarshal(data, &cfg); err != nil {
-		return Config{Hotkey: "F8"}, fmt.Errorf("配置文件格式错误：%w", err)
+		return defaults, fmt.Errorf("配置文件格式错误：%w", err)
 	}
 	key, err := parseHotkey(cfg.Hotkey)
 	if err != nil {
-		return Config{Hotkey: "F8"}, err
+		return defaults, err
 	}
 	cfg.Hotkey = key.Name
+	if cfg.EnhancementPercent, err = normalizeEnhancement(cfg.EnhancementPercent); err != nil {
+		return defaults, err
+	}
 	return cfg, nil
 }
 
@@ -51,6 +67,9 @@ func saveConfig(path string, cfg Config) error {
 		return err
 	}
 	cfg.Hotkey = key.Name
+	if cfg.EnhancementPercent, err = normalizeEnhancement(cfg.EnhancementPercent); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err

@@ -29,6 +29,13 @@ func TestNativeSettingsSmoke(t *testing.T) {
 	if a.selectedDevice() != "saved-device" {
 		t.Fatal("界面必须保留未连接的设备 ID，不能静默改选默认设备")
 	}
+	if a.enhancementSlider.MinValue() != 100 || a.enhancementSlider.MaxValue() != 200 || a.enhancementSlider.Value() != 100 {
+		t.Fatal("增强滑动条必须默认最左 100%，最大 200%")
+	}
+	a.enhancementSlider.SetValue(175)
+	if a.enhancementLabel.Text() != "麦克风增强：175%" {
+		t.Fatal("拖动增强滑动条后应更新百分比")
+	}
 	if err := a.createTray(); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +64,7 @@ func TestNativeSettingsSmoke(t *testing.T) {
 		t.Fatal("取消录入不能覆盖之前的快捷键")
 	}
 	a.applySettings()
-	if cfg, err := loadConfig(a.path); err != nil || cfg.Hotkey != "OEM_3" {
+	if cfg, err := loadConfig(a.path); err != nil || cfg.Hotkey != "OEM_3" || cfg.EnhancementPercent != 175 {
 		t.Fatalf("录入后应用保存失败：%+v, %v", cfg, err)
 	}
 	// 发布虚拟状态，检查实际使用的状态文字与设备列表更新路径。

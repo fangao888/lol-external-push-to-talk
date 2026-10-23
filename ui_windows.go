@@ -25,36 +25,40 @@ const (
 
 // appWindow 把设置、托盘和系统通知连接到音频控制线程。
 type appWindow struct {
-	*walk.MainWindow                       // 原生 Windows 主窗口与消息循环。
-	engine           *controller           // 独立于界面的麦克风控制线程。
-	path             string                // 当前用户的配置文件路径。
-	deviceBox        *walk.ComboBox        // 麦克风设备下拉框。
-	hotkeyEdit       *walk.LineEdit        // 只读快捷键显示框，点击后按键录入。
-	recordButton     *walk.PushButton      // 开始或取消按键录入。
-	hotkeyName       string                // 未保存的标准快捷键名称，与显示文本分离。
-	recording        bool                  // 是否正在录入，录入期间禁止开麦。
-	mouseKeysDown    [3]bool               // 鼠标中键和侧键的前次状态，仅在录入时使用。
-	statusLabel      *walk.Label           // 当前是否正在发言。
-	deviceLabel      *walk.TextLabel       // 实际使用的麦克风名称。
-	errorLabel       *walk.TextLabel       // 音频异常和需要用户处理的提示。
-	pauseButton      *walk.PushButton      // 暂停期间保持静音。
-	tray             *walk.NotifyIcon      // 系统托盘入口。
-	pauseAction      *walk.Action          // 托盘中的暂停菜单项。
-	icons            map[string]*walk.Icon // 各种状态的图标，关闭托盘后统一释放。
-	deviceIDs        []string              // 下拉框索引与稳定设备 ID 的对应关系。
-	deviceStamp      string                // 避免每次刷新状态都重置设备下拉框。
-	iconState        string                // 避免重复设置相同托盘图标。
-	closing          bool                  // 真正退出时允许销毁窗口。
+	*walk.MainWindow                        // 原生 Windows 主窗口与消息循环。
+	engine            *controller           // 独立于界面的麦克风控制线程。
+	path              string                // 当前用户的配置文件路径。
+	deviceBox         *walk.ComboBox        // 麦克风设备下拉框。
+	hotkeyEdit        *walk.LineEdit        // 只读快捷键显示框，点击后按键录入。
+	recordButton      *walk.PushButton      // 开始或取消按键录入。
+	hotkeyName        string                // 未保存的标准快捷键名称，与显示文本分离。
+	enhancementSlider *walk.Slider          // 增强滑动条，最左为 100%，最右为 200%。
+	enhancementLabel  *walk.Label           // 待保存的增强百分比。
+	enhancementStatus *walk.Label           // 当前设备实际应用的增强比例。
+	recording         bool                  // 是否正在录入，录入期间禁止开麦。
+	mouseKeysDown     [3]bool               // 鼠标中键和侧键的前次状态，仅在录入时使用。
+	statusLabel       *walk.Label           // 当前是否正在发言。
+	deviceLabel       *walk.TextLabel       // 实际使用的麦克风名称。
+	errorLabel        *walk.TextLabel       // 音频异常和需要用户处理的提示。
+	pauseButton       *walk.PushButton      // 暂停期间保持静音。
+	tray              *walk.NotifyIcon      // 系统托盘入口。
+	pauseAction       *walk.Action          // 托盘中的暂停菜单项。
+	icons             map[string]*walk.Icon // 各种状态的图标，关闭托盘后统一释放。
+	deviceIDs         []string              // 下拉框索引与稳定设备 ID 的对应关系。
+	deviceStamp       string                // 避免每次刷新状态都重置设备下拉框。
+	iconState         string                // 避免重复设置相同托盘图标。
+	closing           bool                  // 真正退出时允许销毁窗口。
 }
 
 // newAppWindow 只创建界面，不打开麦克风，方便进行无副作用的界面验证。
 func newAppWindow(cfg Config, path string) (*appWindow, error) {
+	cfg.EnhancementPercent, _ = normalizeEnhancement(cfg.EnhancementPercent)
 	a := &appWindow{path: path, hotkeyName: cfg.Hotkey, icons: make(map[string]*walk.Icon)}
 	if err := (MainWindow{
 		AssignTo: &a.MainWindow,
 		Title:    "按键发言工具",
-		Size:     Size{Width: 620, Height: 490},
-		MinSize:  Size{Width: 580, Height: 460},
+		Size:     Size{Width: 620, Height: 595},
+		MinSize:  Size{Width: 580, Height: 565},
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
 		Layout:   VBox{Margins: Margins{Left: 22, Top: 20, Right: 22, Bottom: 18}, Spacing: 12},
 		Children: []Widget{
@@ -70,13 +74,20 @@ func newAppWindow(cfg Config, path string) (*appWindow, error) {
 					PushButton{AssignTo: &a.recordButton, Text: "录入快捷键", OnClicked: a.toggleHotkeyRecording},
 				}},
 				TextLabel{Text: "点击录入后，直接按下需要的按键或组合键，支持 · / ~ 键。快捷键仍会传给游戏。", MinSize: Size{Width: 1}},
+				Label{AssignTo: &a.enhancementLabel, Text: enhancementText(cfg.EnhancementPercent)},
+				Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
+					Label{Text: "100%"},
+					Slider{AssignTo: &a.enhancementSlider, MinValue: 100, MaxValue: 200, Value: cfg.EnhancementPercent, Tracking: true, StretchFactor: 1, OnValueChanged: a.updateEnhancementLabel},
+					Label{Text: "200%"},
+				}},
+				Label{AssignTo: &a.enhancementStatus, Text: "100% 表示不增强，调整后点击“保存并应用”。"},
 				Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 					PushButton{Text: "保存并应用", OnClicked: a.applySettings},
 					PushButton{Text: "刷新麦克风", OnClicked: a.refreshDevices},
 					HSpacer{},
 				}},
 			}},
-			TextLabel{AssignTo: &a.errorLabel, Text: "", MinSize: Size{Width: 1, Height: 35}, TextColor: walk.RGB(175, 62, 35)},
+			TextLabel{AssignTo: &a.errorLabel, Text: "", MinSize: Size{Width: 1, Height: 50}, TextColor: walk.RGB(175, 62, 35)},
 			TextLabel{Text: "LOL 内将语音设为自由发言，由本工具控制实际发言。系统静音会同时影响使用该麦克风的其他软件。", MinSize: Size{Width: 1}},
 			VSpacer{},
 			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
@@ -107,6 +118,21 @@ func newAppWindow(cfg Config, path string) (*appWindow, error) {
 	})
 	a.Deactivating().Attach(func() { a.finishHotkeyRecording(nil) })
 	return a, nil
+}
+
+// enhancementText 标出百分比，并明确最左侧 100% 不改变原始音量。
+func enhancementText(percent int) string {
+	if percent == 100 {
+		return "麦克风增强：100%（不增强）"
+	}
+	return fmt.Sprintf("麦克风增强：%d%%", percent)
+}
+
+// updateEnhancementLabel 只更新待保存的显示，音量由音频线程在应用设置后修改。
+func (a *appWindow) updateEnhancementLabel() {
+	if a.enhancementSlider != nil && a.enhancementLabel != nil {
+		_ = a.enhancementLabel.SetText(enhancementText(a.enhancementSlider.Value()))
+	}
 }
 
 // createTray 建立始终可用的托盘入口，左键打开设置，右键暂停或退出。
@@ -228,7 +254,7 @@ func (a *appWindow) applySettings() {
 		a.showError(err)
 		return
 	}
-	cfg := Config{DeviceID: a.selectedDevice(), Hotkey: key.Name}
+	cfg := Config{DeviceID: a.selectedDevice(), Hotkey: key.Name, EnhancementPercent: a.enhancementSlider.Value()}
 	if err = saveConfig(a.path, cfg); err != nil {
 		a.showError(fmt.Errorf("保存设置失败：%w", err))
 		return
@@ -311,7 +337,19 @@ func (a *appWindow) updateStatus() {
 		deviceName = "等待连接"
 	}
 	_ = a.deviceLabel.SetText("麦克风：" + deviceName)
-	_ = a.errorLabel.SetText(s.Error)
+	message := s.Error
+	if s.EnhancementWarning != "" {
+		if message != "" {
+			message += "\n"
+		}
+		message += s.EnhancementWarning
+	}
+	_ = a.errorLabel.SetText(message)
+	enhancementStatus := "等待确认麦克风增强状态"
+	if s.EnhancementActual > 0 && s.Ready {
+		enhancementStatus = fmt.Sprintf("已应用：%d%%，设备实际约 %.0f%%", s.Config.EnhancementPercent, s.EnhancementActual)
+	}
+	_ = a.enhancementStatus.SetText(enhancementStatus)
 	pauseText := "暂停（保持静音）"
 	if s.Paused {
 		pauseText = "恢复按键发言"

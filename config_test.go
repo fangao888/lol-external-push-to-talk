@@ -109,7 +109,7 @@ func TestHoldGate(t *testing.T) {
 func TestConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "MicPTT", "config.json")
 	cfg, err := loadConfig(path)
-	if err != nil || cfg.Hotkey != "F8" || cfg.DeviceID != "" {
+	if err != nil || cfg.Hotkey != "F8" || cfg.DeviceID != "" || cfg.EnhancementPercent != 100 {
 		t.Fatalf("首次启动默认配置不正确：%+v, %v", cfg, err)
 	}
 	for _, cfg = range []Config{{DeviceID: "设备 A", Hotkey: "v"}, {DeviceID: "设备 B", Hotkey: "ctrl+space"}} {
@@ -130,5 +130,39 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if cfg, err = loadConfig(path); err == nil || cfg.Hotkey != "F8" {
 		t.Fatalf("损坏配置应返回错误及默认设置：%+v, %v", cfg, err)
+	}
+}
+
+// TestEnhancementConfig 验证旧配置默认不增强、保存比例以及拒绝越界设置。
+func TestEnhancementConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"hotkey":"F8"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := loadConfig(path); err != nil || cfg.EnhancementPercent != 100 {
+		t.Fatalf("旧配置应默认 100%%：%+v, %v", cfg, err)
+	}
+	for _, percent := range []int{0, 100, 150, 200} {
+		if err := saveConfig(path, Config{Hotkey: "F8", EnhancementPercent: percent}); err != nil {
+			t.Fatal(err)
+		}
+		want := percent
+		if want == 0 {
+			want = 100
+		}
+		if cfg, err := loadConfig(path); err != nil || cfg.EnhancementPercent != want {
+			t.Fatalf("增强配置未保存：%+v, %v", cfg, err)
+		}
+	}
+	for _, percent := range []int{-1, 99, 201} {
+		if err := saveConfig(path, Config{Hotkey: "F8", EnhancementPercent: percent}); err == nil {
+			t.Fatalf("不应接受增强比例 %d", percent)
+		}
+	}
+	if err := os.WriteFile(path, []byte(`{"hotkey":"F8","enhancement_percent":201}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := loadConfig(path); err == nil || cfg.EnhancementPercent != 100 {
+		t.Fatalf("越界配置应报告错误并返回默认设置：%+v, %v", cfg, err)
 	}
 }

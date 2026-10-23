@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,10 +12,16 @@ import (
 
 // fakeEndpoint 记录控制循环的实际静音操作，不改变本机麦克风。
 type fakeEndpoint struct {
-	mu   sync.Mutex // 保护测试线程和音频控制线程共享的设备状态。
-	dev  Device     // 模拟端点标识。
-	mute bool       // 模拟设备当前静音状态。
-	err  error      // 模拟设备拔出或驱动失败。
+	mu             sync.Mutex // 保护测试线程和音频控制线程共享的设备状态。
+	dev            Device     // 模拟端点标识。
+	mute           bool       // 模拟设备当前静音状态。
+	err            error      // 模拟设备拔出或驱动失败。
+	volume         float32    // 模拟系统录音音量，单位 dB。
+	maximum        float32    // 模拟硬件最高音量。
+	volumeErr      error      // 仅音量控制失败，不影响静音。
+	volumeWriteErr error      // 只拒绝音量写入，模拟只读驱动。
+	volumeStep     float32    // 模拟离散音量步长，0 表示可连续设置。
+	volumeWrites   int        // 验证默认设置和重复应用不会写入音量。
 }
 
 // info 返回端点的只读标识。
@@ -46,6 +53,47 @@ func (f *fakeEndpoint) setError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
+}
+
+// volumeDB 读取虚拟增益，不访问本机音频设备。
+func (f *fakeEndpoint) volumeDB() (float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.volume, f.volumeErr
+}
+
+// volumeRangeDB 提供可测的驱动上限。
+func (f *fakeEndpoint) volumeRangeDB() (float32, float32, float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return -96, f.maximum, f.volumeStep, f.volumeErr
+}
+
+// setVolumeDB 只修改虚拟音量，并记录写入次数。
+func (f *fakeEndpoint) setVolumeDB(value float32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.volumeErr != nil {
+		return f.volumeErr
+	}
+	if f.volumeWriteErr != nil {
+		return f.volumeWriteErr
+	}
+	if value < -96 || value > f.maximum {
+		return fmt.Errorf("音量超出设备范围：%f", value)
+	}
+	if f.volumeStep > 0 {
+		value = min(f.maximum, -96+float32(math.Round(float64((value+96)/f.volumeStep)))*f.volumeStep)
+	}
+	f.volume = value
+	f.volumeWrites++
+	return nil
 }
 
 // fakeAudio 模拟默认设备改变及设备拔插后产生的新接口。

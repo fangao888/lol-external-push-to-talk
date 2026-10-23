@@ -15,14 +15,16 @@ var getAsyncKeyState = windows.NewLazySystemDLL("user32.dll").NewProc("GetAsyncK
 
 // Snapshot 是不可变的界面快照，音频线程发布后不再修改其中的数据。
 type Snapshot struct {
-	Config   Config   // 当前生效的设置。
-	Devices  []Device // 最近一次枚举得到的可用麦克风。
-	Device   string   // 实际控制的麦克风名称。
-	Speaking bool     // 已确认解除静音，并且快捷键仍按住。
-	Paused   bool     // 用户是否暂停按键发言，暂停期间保持静音。
-	Blocked  bool     // 锁屏、休眠或关闭系统期间禁止开麦。
-	Ready    bool     // 音频设备是否已成功连接。
-	Error    string   // 最近的音频错误，空字符串表示正常。
+	Config             Config   // 当前生效的设置。
+	Devices            []Device // 最近一次枚举得到的可用麦克风。
+	Device             string   // 实际控制的麦克风名称。
+	Speaking           bool     // 已确认解除静音，并且快捷键仍按住。
+	Paused             bool     // 用户是否暂停按键发言，暂停期间保持静音。
+	Blocked            bool     // 锁屏、休眠或关闭系统期间禁止开麦。
+	Ready              bool     // 音频设备是否已成功连接。
+	Error              string   // 最近的音频错误，空字符串表示正常。
+	EnhancementActual  float64  // 驱动确认的实际增强百分比；0 表示暂时无法确认。
+	EnhancementWarning string   // 增强不支持、硬件上限或音量恢复提示，不阻止按键发言。
 }
 
 // controlCommand 将所有 COM 操作串行交给音频线程，避免跨线程使用接口。
@@ -112,7 +114,9 @@ func (c *controller) run(cfg Config) {
 
 // control 串行执行所有静音操作；注入设备和按键来源可验证异常与恢复流程。
 func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotkey) (bool, bool)) {
+	cfg.EnhancementPercent, _ = normalizeEnhancement(cfg.EnhancementPercent)
 	state := Snapshot{Config: cfg}
+	gains := make(gainSession)
 	var mic audioEndpoint
 	var normalExit bool // 正常退出已解除静音；异常退出时仍尽力静音，避免意外持续发言。
 	// 正常退出只释放接口，避免把刚恢复可用的麦克风再次静音。
@@ -122,9 +126,13 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 				if err := mic.setMute(true); err != nil {
 					log.Printf("异常退出时静音失败：%v", err)
 				}
+				if err := gains.restore(mic); err != nil {
+					log.Printf("异常退出时恢复麦克风音量失败：%v", err)
+				}
 			}
 			mic.close()
 		}
+		gains.logUnrestored()
 		if recovered := recover(); recovered != nil {
 			state.Speaking, state.Ready = false, false
 			state.Error = fmt.Sprintf("控制线程异常：%v，请重启程序并检查系统静音状态", recovered)
@@ -151,6 +159,7 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 		state.Error, state.Speaking, state.Ready = err.Error(), false, false
 		gate.armed = false
 		if mic != nil {
+			gains.invalidate(mic)
 			// 暂留失败端点，下一次检查前继续尝试静音，不静默切换到别的麦克风。
 			if muteErr := mic.setMute(true); endpointGone(muteErr) {
 				mic.close()
@@ -172,6 +181,12 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 					cmdErr = parseErr
 					break
 				}
+				percent, gainErr := normalizeEnhancement(cmd.config.EnhancementPercent)
+				if gainErr != nil {
+					cmdErr = gainErr
+					break
+				}
+				cmd.config.EnhancementPercent = percent
 				cfg, key = cmd.config, newKey
 				state.Config = cfg
 				nextDeviceCheck = time.Time{}
@@ -190,7 +205,10 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 				state.Blocked = blockFlags != 0
 			case "stop":
 				if mic != nil {
-					cmdErr = mic.setMute(false)
+					cmdErr = gains.restore(mic)
+					if cmdErr == nil || endpointGone(cmdErr) {
+						cmdErr = mic.setMute(false)
+					}
 					if endpointGone(cmdErr) {
 						cmdErr = nil // 系统已确认端点失效，释放旧接口后即可退出。
 					}
@@ -201,6 +219,7 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 					cmd.reply <- cmdErr
 					continue // 恢复失败时保持程序运行，让用户看到错误并重试。
 				}
+				_ = gains.restoreOthers(audio, mic)
 				normalExit = true
 				cmd.reply <- nil
 				return
@@ -244,6 +263,9 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 							publish()
 							continue
 						}
+						if gainErr := gains.restore(mic); gainErr != nil {
+							log.Printf("切换麦克风时恢复音量失败：%v", gainErr)
+						}
 						mic.close()
 					}
 					mic = candidate
@@ -253,6 +275,15 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 					} else {
 						lastMute = true
 						state.Device, state.Ready, state.Error = mic.info().Name, true, ""
+					}
+				}
+				if mic != nil && state.Ready {
+					state.EnhancementActual, state.EnhancementWarning = gains.apply(mic, cfg.EnhancementPercent)
+					if warning := gains.restoreOthers(audio, mic); warning != "" {
+						if state.EnhancementWarning != "" {
+							state.EnhancementWarning += "\n"
+						}
+						state.EnhancementWarning += warning
 					}
 				}
 			}

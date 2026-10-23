@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -17,6 +18,13 @@ type audioEndpoint interface {
 	setMute(bool) error   // 设置系统静音。
 	muted() (bool, error) // 查询实际静音。
 	close()               // 释放端点接口。
+}
+
+// endpointGain 是可选的系统音量接口；不支持增强的设备仍可继续按键发言。
+type endpointGain interface {
+	volumeDB() (float32, error)                        // 读取当前录音音量，单位 dB。
+	volumeRangeDB() (float32, float32, float32, error) // 返回最低、最高音量及驱动步长。
+	setVolumeDB(float32) error                         // 设置录音音量，不改变静音状态。
 }
 
 // audioBackend 将设备发现和打开集中在所属 COM 线程。
@@ -247,6 +255,24 @@ func (m *microphone) muted() (bool, error) {
 	var value int32
 	err := m.object.invoke(15, uintptr(unsafe.Pointer(&value)))
 	return value != 0, err
+}
+
+// volumeDB 通过 IAudioEndpointVolume 读取实际录音音量。
+func (m *microphone) volumeDB() (float32, error) {
+	var value float32
+	err := m.object.invoke(8, uintptr(unsafe.Pointer(&value)))
+	return value, err
+}
+
+// volumeRangeDB 读取驱动允许的 dB 范围，避免把增强比例错误地传给 0～1 音量接口。
+func (m *microphone) volumeRangeDB() (minimum, maximum, step float32, err error) {
+	err = m.object.invoke(20, uintptr(unsafe.Pointer(&minimum)), uintptr(unsafe.Pointer(&maximum)), uintptr(unsafe.Pointer(&step)))
+	return
+}
+
+// setVolumeDB 将 float32 的原始位传入 Windows ABI，兼容 amd64 浮点寄存器与 386 栈参数。
+func (m *microphone) setVolumeDB(value float32) error {
+	return m.object.invoke(6, uintptr(math.Float32bits(value)), 0)
 }
 
 // close 只释放音量接口，不改变端点静音状态。
