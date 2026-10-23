@@ -116,7 +116,7 @@ func testController(t *testing.T, backend *fakeAudio, keys *atomic.Bool, reads *
 	}()
 	t.Cleanup(func() {
 		if err := c.stop(); err != nil {
-			t.Errorf("测试结束时无法静音退出：%v", err)
+			t.Errorf("测试结束时无法恢复麦克风并退出：%v", err)
 		}
 	})
 	return c
@@ -206,8 +206,8 @@ func TestControllerHoldPauseSafety(t *testing.T) {
 	if err := c.stop(); err != nil {
 		t.Fatal(err)
 	}
-	if mute, _ := mic.muted(); !mute {
-		t.Fatal("退出时必须保持静音")
+	if mute, _ := mic.muted(); mute {
+		t.Fatal("正常退出后必须解除静音")
 	}
 }
 
@@ -248,8 +248,44 @@ func TestControllerDeviceChangeAndReconnect(t *testing.T) {
 	waitUntil(t, func() bool { mute, _ := reconnected.muted(); return !mute })
 }
 
-// TestControllerMuteFailure 阻止在驱动拒绝静音时假报成功退出，恢复后允许重试。
-func TestControllerMuteFailure(t *testing.T) {
+// TestControllerExitUnmutes 验证退出时松键、暂停或启动前已静音都不会让麦克风保持静音。
+func TestControllerExitUnmutes(t *testing.T) {
+	for _, tc := range []struct {
+		name         string // 退出场景名称。
+		initialMuted bool   // 工具启动前麦克风是否已静音。
+		paused       bool   // 是否从暂停状态退出。
+	}{
+		{name: "松键时退出"},
+		{name: "暂停时退出", paused: true},
+		{name: "启动前已静音", initialMuted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mic := &fakeEndpoint{dev: Device{ID: "A", Name: "麦克风 A"}, mute: tc.initialMuted}
+			backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
+			var keys atomic.Bool
+			var reads atomic.Int64
+			c := testController(t, backend, &keys, &reads)
+			waitUntil(t, func() bool { return c.snapshot.Load().Ready })
+			if tc.paused {
+				if err := c.request(controlCommand{kind: "pause"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mute, _ := mic.muted(); !mute {
+				t.Fatal("运行期间未按发言键时应保持静音")
+			}
+			if err := c.stop(); err != nil {
+				t.Fatal(err)
+			}
+			if mute, _ := mic.muted(); mute {
+				t.Fatal("退出完成后，清理逻辑不能再次把麦克风静音")
+			}
+		})
+	}
+}
+
+// TestControllerExitRestoreFailure 阻止在驱动拒绝解除静音时假报退出成功，恢复后允许重试。
+func TestControllerExitRestoreFailure(t *testing.T) {
 	mic := &fakeEndpoint{dev: Device{ID: "A", Name: "麦克风 A"}}
 	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
 	var keys atomic.Bool
@@ -258,21 +294,21 @@ func TestControllerMuteFailure(t *testing.T) {
 	waitUntil(t, func() bool { return c.snapshot.Load().Ready })
 	keys.Store(true)
 	waitUntil(t, func() bool { mute, _ := mic.muted(); return !mute })
-	mic.setError(errors.New("模拟驱动拒绝静音"))
+	mic.setError(errors.New("模拟驱动拒绝解除静音"))
 	defer mic.setError(nil)
 	if err := c.stop(); err == nil {
-		t.Fatal("静音失败时不应假报成功退出")
+		t.Fatal("解除静音失败时不应假报成功退出")
 	}
 	select {
 	case <-c.done:
-		t.Fatal("静音失败时应继续运行，允许用户处理问题")
+		t.Fatal("解除静音失败时应继续运行，允许用户处理问题")
 	default:
 	}
 	mic.setError(nil)
 	if err := c.stop(); err != nil {
 		t.Fatal(err)
 	}
-	if mute, _ := mic.muted(); !mute {
-		t.Fatal("重试退出后应保持静音")
+	if mute, _ := mic.muted(); mute {
+		t.Fatal("重试退出后应解除静音")
 	}
 }

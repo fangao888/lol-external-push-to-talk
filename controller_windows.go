@@ -70,7 +70,7 @@ func (c *controller) request(cmd controlCommand) error {
 	}
 }
 
-// stop 在正常退出时等待静音完成，不直接终止音频线程。
+// stop 在正常退出时等待解除静音完成，麦克风随后可由其他软件正常使用。
 func (c *controller) stop() error {
 	select {
 	case <-c.done:
@@ -114,11 +114,14 @@ func (c *controller) run(cfg Config) {
 func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotkey) (bool, bool)) {
 	state := Snapshot{Config: cfg}
 	var mic audioEndpoint
-	// 即使普通错误或 panic 让循环退出，也尽力把已打开的端点恢复为静音。
+	var normalExit bool // 正常退出已解除静音；异常退出时仍尽力静音，避免意外持续发言。
+	// 正常退出只释放接口，避免把刚恢复可用的麦克风再次静音。
 	defer func() {
 		if mic != nil {
-			if err := mic.setMute(true); err != nil {
-				log.Printf("退出时静音失败：%v", err)
+			if !normalExit {
+				if err := mic.setMute(true); err != nil {
+					log.Printf("异常退出时静音失败：%v", err)
+				}
 			}
 			mic.close()
 		}
@@ -187,17 +190,18 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 				state.Blocked = blockFlags != 0
 			case "stop":
 				if mic != nil {
-					cmdErr = mic.setMute(true)
+					cmdErr = mic.setMute(false)
 					if endpointGone(cmdErr) {
-						cmdErr = nil // 已失效的端点无法继续采集声音，可以正常退出。
+						cmdErr = nil // 系统已确认端点失效，释放旧接口后即可退出。
 					}
 				}
 				if cmdErr != nil {
 					fail(cmdErr)
 					publish()
 					cmd.reply <- cmdErr
-					continue // 静音失败时保持程序运行，让用户看到错误并重试。
+					continue // 恢复失败时保持程序运行，让用户看到错误并重试。
 				}
+				normalExit = true
 				cmd.reply <- nil
 				return
 			}

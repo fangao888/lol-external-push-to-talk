@@ -89,7 +89,10 @@ func run() error {
 	log.Printf("启动：快捷键=%s", cfg.Hotkey)
 	a.Show()
 	a.Run()
-	log.Print("程序正常退出，麦克风保持静音")
+	if err := a.engine.stop(); err != nil {
+		return fmt.Errorf("退出时恢复麦克风失败：%w", err)
+	}
+	log.Print("程序正常退出，已解除所控麦克风的静音")
 	return nil
 }
 

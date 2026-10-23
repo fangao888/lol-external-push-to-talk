@@ -83,7 +83,7 @@ func newAppWindow(cfg Config, path string) (*appWindow, error) {
 				PushButton{AssignTo: &a.pauseButton, Text: "暂停（保持静音）", OnClicked: a.togglePause},
 				PushButton{Text: "收起到托盘", OnClicked: func() { a.Hide() }},
 				HSpacer{},
-				PushButton{Text: "退出（保持静音）", OnClicked: a.quit},
+				PushButton{Text: "退出（恢复麦克风）", OnClicked: a.quit},
 			}},
 		},
 	}).Create(); err != nil {
@@ -149,7 +149,7 @@ func (a *appWindow) createTray() error {
 	}{
 		{text: "打开设置", fn: a.showSettings},
 		{text: "暂停（保持静音）", fn: a.togglePause, keep: &a.pauseAction},
-		{text: "退出（保持静音）", fn: a.quit},
+		{text: "退出（恢复麦克风）", fn: a.quit},
 	} {
 		action := walk.NewAction()
 		if err = action.SetText(item.text); err != nil {
@@ -261,11 +261,11 @@ func (a *appWindow) togglePause() {
 	}
 }
 
-// quit 等到音频线程成功静音后才真正退出，失败则保留界面供用户处理。
+// quit 等到音频线程解除静音后才真正退出，失败则保留界面供用户处理。
 func (a *appWindow) quit() {
 	if a.engine != nil {
 		if err := a.engine.stop(); err != nil {
-			a.showError(fmt.Errorf("退出前静音失败，请先检查系统麦克风后重试：%w", err))
+			a.showError(fmt.Errorf("退出前恢复麦克风失败，请检查系统麦克风后重试：%w", err))
 			return
 		}
 	}

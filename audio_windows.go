@@ -249,7 +249,7 @@ func (m *microphone) muted() (bool, error) {
 	return value != 0, err
 }
 
-// close 释放音量接口；调用方必须先确认端点已静音。
+// close 只释放音量接口，不改变端点静音状态。
 func (m *microphone) close() {
 	m.object.release()
 }
