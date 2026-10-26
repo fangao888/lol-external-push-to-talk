@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 	"github.com/lxn/win"
 )
 
-// TestNativeSettingsSmoke 仅在显式启用时验证原生窗口和托盘，全程不控制真实麦克风。
+// TestNativeSettingsSmoke 仅在显式启用时验证原生窗口与关闭恢复，全程不控制真实麦克风。
 func TestNativeSettingsSmoke(t *testing.T) {
 	if os.Getenv("MICPTT_UI_TEST") != "1" {
 		t.Skip("设置 MICPTT_UI_TEST=1 运行原生界面烟雾测试")
@@ -35,9 +36,6 @@ func TestNativeSettingsSmoke(t *testing.T) {
 	a.enhancementSlider.SetValue(175)
 	if a.enhancementLabel.Text() != "麦克风增强：175%" {
 		t.Fatal("拖动增强滑动条后应更新百分比")
-	}
-	if err := a.createTray(); err != nil {
-		t.Fatal(err)
 	}
 	// 直接向本程序控件发送原生消息，不向系统或其他应用模拟键盘输入。
 	for _, vk := range []uintptr{0x09, 0x0D, 0x1B, 0xBB, 0xC0} {
@@ -76,6 +74,19 @@ func TestNativeSettingsSmoke(t *testing.T) {
 	if a.statusLabel.Text() != "已静音 · 按住 F8 发言" {
 		t.Fatalf("状态显示错误：%s", a.statusLabel.Text())
 	}
+	// 接入真实控制循环和虚拟麦克风，验证标题栏关闭前完成音量恢复与解除静音。
+	mic := &fakeEndpoint{dev: Device{ID: "A", Name: "测试麦克风"}, volume: -12, maximum: 12}
+	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
+	var keys atomic.Bool
+	var reads atomic.Int64
+	engine := testController(t, backend, &keys, &reads)
+	waitUntil(t, func() bool { return engine.snapshot.Load().Ready })
+	if err := engine.request(controlCommand{kind: "apply", config: Config{Hotkey: "F8", EnhancementPercent: 175}}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return engine.snapshot.Load().EnhancementActual > 174 })
+	a.engine = engine
+	a.updateStatus()
 	var captureErr error
 	time.AfterFunc(700*time.Millisecond, func() {
 		a.Synchronize(func() {
@@ -83,7 +94,22 @@ func TestNativeSettingsSmoke(t *testing.T) {
 			if path := os.Getenv("MICPTT_SCREENSHOT"); path != "" {
 				captureErr = captureWindow(a.MainWindow, path)
 			}
-			a.quit()
+			switch os.Getenv("MICPTT_CLOSE_TEST") {
+			case "button":
+				a.quit()
+			case "altf4":
+				a.SendMessage(win.WM_SYSCOMMAND, win.SC_CLOSE, 0)
+			case "session":
+				a.SendMessage(win.WM_QUERYENDSESSION, 0, 0)
+				a.SendMessage(win.WM_ENDSESSION, 1, 0)
+				a.quit() // 模拟系统已结束会话后的窗口销毁。
+			default:
+				a.SendMessage(win.WM_CLOSE, 0, 0) // 与标题栏 X 触发相同的关闭消息。
+			}
+			if !a.closing {
+				captureErr = fmt.Errorf("关闭窗口未触发麦克风恢复与退出")
+				walk.App().Exit(1) // 测试失败时结束消息循环，避免隐藏窗口造成测试挂起。
+			}
 		})
 	})
 	a.Show()
@@ -91,6 +117,15 @@ func TestNativeSettingsSmoke(t *testing.T) {
 	a.Run()
 	if captureErr != nil {
 		t.Fatal(captureErr)
+	}
+	if muted, err := mic.muted(); err != nil || muted {
+		t.Fatalf("关闭窗口后麦克风必须解除静音：muted=%v, err=%v", muted, err)
+	}
+	assertVolume(t, mic, -12)
+	select {
+	case <-engine.done:
+	default:
+		t.Fatal("窗口关闭后音频线程仍在后台运行")
 	}
 }
 

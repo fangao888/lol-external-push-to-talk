@@ -360,3 +360,123 @@ func TestControllerExitRestoreFailure(t *testing.T) {
 		t.Fatal("重试退出后应解除静音")
 	}
 }
+
+// TestControllerExitRestoresAllDevices 验证退出会恢复本次使用过的所有仍连接麦克风。
+func TestControllerExitRestoresAllDevices(t *testing.T) {
+	first := &fakeEndpoint{dev: Device{ID: "A", Name: "麦克风 A"}, volume: -12, maximum: 12}
+	second := &fakeEndpoint{dev: Device{ID: "B", Name: "麦克风 B"}, volume: -18, maximum: 12}
+	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": first, "B": second}, defaultID: "A"}
+	var keys atomic.Bool
+	var reads atomic.Int64
+	c := testController(t, backend, &keys, &reads)
+	waitUntil(t, func() bool { return c.snapshot.Load().Ready })
+	if err := c.request(controlCommand{kind: "apply", config: Config{Hotkey: "F8", EnhancementPercent: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return c.snapshot.Load().EnhancementActual > 199 })
+	if err := c.request(controlCommand{kind: "apply", config: Config{Hotkey: "F8", DeviceID: "B", EnhancementPercent: 150}}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return c.snapshot.Load().Device == "麦克风 B" })
+	if err := c.stop(); err != nil {
+		t.Fatal(err)
+	}
+	for _, mic := range []*fakeEndpoint{first, second} {
+		if muted, err := mic.muted(); err != nil || muted {
+			t.Fatalf("退出后设备 %s 未恢复：muted=%v, err=%v", mic.info().Name, muted, err)
+		}
+	}
+	assertVolume(t, first, -12)
+	assertVolume(t, second, -18)
+}
+
+// TestControllerExitGainFailureStillUnmutes 验证音量恢复失败也先解除静音，等待重试期间不会再次接管。
+func TestControllerExitGainFailureStillUnmutes(t *testing.T) {
+	mic := &fakeEndpoint{dev: Device{ID: "A", Name: "测试麦克风"}, volume: -12, maximum: 12}
+	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
+	var keys atomic.Bool
+	var reads atomic.Int64
+	c := testController(t, backend, &keys, &reads)
+	waitUntil(t, func() bool { return c.snapshot.Load().Ready })
+	if err := c.request(controlCommand{kind: "apply", config: Config{Hotkey: "F8", EnhancementPercent: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return c.snapshot.Load().EnhancementActual > 199 })
+	mic.mu.Lock()
+	mic.volumeWriteErr = errors.New("模拟驱动拒绝恢复音量")
+	mic.mu.Unlock()
+	defer func() {
+		mic.mu.Lock()
+		mic.volumeWriteErr = nil
+		mic.mu.Unlock()
+	}()
+	if err := c.stop(); err == nil {
+		t.Fatal("恢复音量失败时应返回错误供用户重试")
+	}
+	before := reads.Load()
+	time.Sleep(150 * time.Millisecond) // 超过原来的静音检查周期，确认退出失败后不会恢复静音循环。
+	if muted, _ := mic.muted(); muted || reads.Load() != before {
+		t.Fatal("关闭失败后不应继续按键检测或把麦克风再次静音")
+	}
+	mic.mu.Lock()
+	mic.volumeWriteErr = nil
+	mic.mu.Unlock()
+	if err := c.stop(); err != nil {
+		t.Fatal(err)
+	}
+	assertVolume(t, mic, -12)
+}
+
+// TestControllerCloseRetryReconnect 验证关闭失败后重连设备，再次关闭能使用新的端点接口恢复。
+func TestControllerCloseRetryReconnect(t *testing.T) {
+	mic := &fakeEndpoint{dev: Device{ID: "A", Name: "测试麦克风"}, volume: -12, maximum: 12}
+	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
+	var keys atomic.Bool
+	var reads atomic.Int64
+	c := testController(t, backend, &keys, &reads)
+	waitUntil(t, func() bool { return c.snapshot.Load().Ready })
+	if err := c.request(controlCommand{kind: "apply", config: Config{Hotkey: "F8", EnhancementPercent: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return c.snapshot.Load().EnhancementActual > 199 })
+	boosted, _ := mic.volumeDB()
+	mic.setError(errors.New("模拟关闭时驱动拒绝恢复"))
+	if err := c.stop(); err == nil {
+		t.Fatal("恢复失败应等待重试")
+	}
+	mic.setError(&audioAPIError{Code: 0x88890004})
+	reconnected := &fakeEndpoint{dev: mic.dev, volume: boosted, maximum: 12, mute: true}
+	backend.replace(reconnected)
+	if err := c.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if muted, _ := reconnected.muted(); muted {
+		t.Fatal("退出重试必须恢复重新连接的端点")
+	}
+	assertVolume(t, reconnected, -12)
+}
+
+// TestControllerPanicRestores 验证控制线程可捕获的异常也会恢复音量并解除静音。
+func TestControllerPanicRestores(t *testing.T) {
+	mic := &fakeEndpoint{dev: Device{ID: "A", Name: "测试麦克风"}, volume: -12, maximum: 12}
+	backend := &fakeAudio{items: map[string]*fakeEndpoint{"A": mic}, defaultID: "A"}
+	c := &controller{commands: make(chan controlCommand, 8), done: make(chan struct{})}
+	go func() {
+		defer close(c.done)
+		c.control(Config{Hotkey: "F8", EnhancementPercent: 200}, backend, func(Hotkey) (bool, bool) {
+			panic("模拟音频控制线程异常")
+		})
+	}()
+	select {
+	case <-c.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("控制线程异常后没有结束")
+	}
+	if err := c.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if muted, err := mic.muted(); err != nil || muted {
+		t.Fatalf("异常清理后麦克风没有恢复：muted=%v, err=%v", muted, err)
+	}
+	assertVolume(t, mic, -12)
+}

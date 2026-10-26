@@ -25,7 +25,7 @@ func main() {
 	}
 }
 
-// run 初始化配置、单实例、托盘和系统通知，界面准备完成后才接管麦克风。
+// run 初始化配置、单实例和系统通知，界面准备完成后才接管麦克风。
 func run() error {
 	diagnostic := flag.Bool("diagnose", false, "只读列出录音设备及所选设备静音状态，不启动控制")
 	flag.Parse()
@@ -57,7 +57,7 @@ func run() error {
 			win.SetForegroundWindow(hwnd)
 			return nil
 		}
-		return fmt.Errorf("按键发言工具已在运行，请从系统托盘打开")
+		return fmt.Errorf("按键发言工具已在运行，请从任务栏切换到已有窗口")
 	}
 	if mutexErr != nil {
 		return fmt.Errorf("创建单实例锁失败：%w", mutexErr)
@@ -68,9 +68,6 @@ func run() error {
 	}
 	defer a.Dispose()
 	defer a.disposeResources()
-	if err = a.createTray(); err != nil {
-		return fmt.Errorf("创建系统托盘失败：%w", err)
-	}
 	register := windows.NewLazySystemDLL("wtsapi32.dll").NewProc("WTSRegisterSessionNotification")
 	unregister := windows.NewLazySystemDLL("wtsapi32.dll").NewProc("WTSUnRegisterSessionNotification")
 	if ok, _, callErr := register.Call(uintptr(a.Handle()), 0); ok == 0 {

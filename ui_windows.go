@@ -23,37 +23,34 @@ const (
 	captureTimerID  = 0x4D51
 )
 
-// appWindow 把设置、托盘和系统通知连接到音频控制线程。
+// appWindow 把设置、窗口关闭和系统通知连接到音频控制线程。
 type appWindow struct {
-	*walk.MainWindow                        // 原生 Windows 主窗口与消息循环。
-	engine            *controller           // 独立于界面的麦克风控制线程。
-	path              string                // 当前用户的配置文件路径。
-	deviceBox         *walk.ComboBox        // 麦克风设备下拉框。
-	hotkeyEdit        *walk.LineEdit        // 只读快捷键显示框，点击后按键录入。
-	recordButton      *walk.PushButton      // 开始或取消按键录入。
-	hotkeyName        string                // 未保存的标准快捷键名称，与显示文本分离。
-	enhancementSlider *walk.Slider          // 增强滑动条，最左为 100%，最右为 200%。
-	enhancementLabel  *walk.Label           // 待保存的增强百分比。
-	enhancementStatus *walk.Label           // 当前设备实际应用的增强比例。
-	recording         bool                  // 是否正在录入，录入期间禁止开麦。
-	mouseKeysDown     [3]bool               // 鼠标中键和侧键的前次状态，仅在录入时使用。
-	statusLabel       *walk.Label           // 当前是否正在发言。
-	deviceLabel       *walk.TextLabel       // 实际使用的麦克风名称。
-	errorLabel        *walk.TextLabel       // 音频异常和需要用户处理的提示。
-	pauseButton       *walk.PushButton      // 暂停期间保持静音。
-	tray              *walk.NotifyIcon      // 系统托盘入口。
-	pauseAction       *walk.Action          // 托盘中的暂停菜单项。
-	icons             map[string]*walk.Icon // 各种状态的图标，关闭托盘后统一释放。
-	deviceIDs         []string              // 下拉框索引与稳定设备 ID 的对应关系。
-	deviceStamp       string                // 避免每次刷新状态都重置设备下拉框。
-	iconState         string                // 避免重复设置相同托盘图标。
-	closing           bool                  // 真正退出时允许销毁窗口。
+	*walk.MainWindow                   // 原生 Windows 主窗口与消息循环。
+	engine            *controller      // 独立于界面的麦克风控制线程。
+	path              string           // 当前用户的配置文件路径。
+	deviceBox         *walk.ComboBox   // 麦克风设备下拉框。
+	hotkeyEdit        *walk.LineEdit   // 只读快捷键显示框，点击后按键录入。
+	recordButton      *walk.PushButton // 开始或取消按键录入。
+	hotkeyName        string           // 未保存的标准快捷键名称，与显示文本分离。
+	enhancementSlider *walk.Slider     // 增强滑动条，最左为 100%，最右为 200%。
+	enhancementLabel  *walk.Label      // 待保存的增强百分比。
+	enhancementStatus *walk.Label      // 当前设备实际应用的增强比例。
+	recording         bool             // 是否正在录入，录入期间禁止开麦。
+	mouseKeysDown     [3]bool          // 鼠标中键和侧键的前次状态，仅在录入时使用。
+	statusLabel       *walk.Label      // 当前是否正在发言。
+	deviceLabel       *walk.TextLabel  // 实际使用的麦克风名称。
+	errorLabel        *walk.TextLabel  // 音频异常和需要用户处理的提示。
+	pauseButton       *walk.PushButton // 暂停期间保持静音。
+	icon              *walk.Icon       // 主窗口图标，退出时释放。
+	deviceIDs         []string         // 下拉框索引与稳定设备 ID 的对应关系。
+	deviceStamp       string           // 避免每次刷新状态都重置设备下拉框。
+	closing           bool             // 真正退出时允许销毁窗口。
 }
 
 // newAppWindow 只创建界面，不打开麦克风，方便进行无副作用的界面验证。
 func newAppWindow(cfg Config, path string) (*appWindow, error) {
 	cfg.EnhancementPercent, _ = normalizeEnhancement(cfg.EnhancementPercent)
-	a := &appWindow{path: path, hotkeyName: cfg.Hotkey, icons: make(map[string]*walk.Icon)}
+	a := &appWindow{path: path, hotkeyName: cfg.Hotkey}
 	if err := (MainWindow{
 		AssignTo: &a.MainWindow,
 		Title:    "按键发言工具",
@@ -92,7 +89,6 @@ func newAppWindow(cfg Config, path string) (*appWindow, error) {
 			VSpacer{},
 			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 				PushButton{AssignTo: &a.pauseButton, Text: "暂停（保持静音）", OnClicked: a.togglePause},
-				PushButton{Text: "收起到托盘", OnClicked: func() { a.Hide() }},
 				HSpacer{},
 				PushButton{Text: "退出（恢复麦克风）", OnClicked: a.quit},
 			}},
@@ -109,11 +105,21 @@ func newAppWindow(cfg Config, path string) (*appWindow, error) {
 		return nil, err
 	}
 	a.setDevices(nil, cfg.DeviceID)
+	icon, err := microphoneIcon(color.RGBA{R: 196, G: 58, B: 67, A: 255})
+	if err != nil {
+		a.Dispose()
+		return nil, err
+	}
+	a.icon = icon
+	if err = a.SetIcon(icon); err != nil {
+		a.Dispose()
+		a.disposeResources()
+		return nil, err
+	}
 	a.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		if !a.closing {
+		if err := a.restoreBeforeClose(); err != nil {
 			*canceled = true
-			a.finishHotkeyRecording(nil)
-			a.Hide()
+			a.showError(fmt.Errorf("麦克风尚未恢复，窗口会保持打开。请检查设备后再次关闭：%w", err))
 		}
 	})
 	a.Deactivating().Attach(func() { a.finishHotkeyRecording(nil) })
@@ -135,78 +141,12 @@ func (a *appWindow) updateEnhancementLabel() {
 	}
 }
 
-// createTray 建立始终可用的托盘入口，左键打开设置，右键暂停或退出。
-func (a *appWindow) createTray() error {
-	for name, c := range map[string]color.RGBA{
-		"muted": {R: 196, G: 58, B: 67, A: 255},
-		"speak": {R: 25, G: 150, B: 91, A: 255},
-		"pause": {R: 103, G: 115, B: 136, A: 255},
-		"error": {R: 201, G: 132, B: 24, A: 255},
-	} {
-		icon, err := microphoneIcon(c)
-		if err != nil {
-			return err
-		}
-		a.icons[name] = icon
-	}
-	var err error
-	a.tray, err = walk.NewNotifyIcon(a.MainWindow)
-	if err != nil {
-		return err
-	}
-	if err = a.SetIcon(a.icons["muted"]); err != nil {
-		return err
-	}
-	if err = a.tray.SetIcon(a.icons["muted"]); err != nil {
-		return err
-	}
-	if err = a.tray.SetToolTip("按键发言工具：正在连接"); err != nil {
-		return err
-	}
-	a.tray.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
-		if button == walk.LeftButton {
-			a.showSettings()
-		}
-	})
-	for _, item := range []struct {
-		text string        // 菜单显示文字。
-		fn   func()        // 在界面线程执行的菜单动作。
-		keep **walk.Action // 可选的菜单项引用，用于更新暂停文字。
-	}{
-		{text: "打开设置", fn: a.showSettings},
-		{text: "暂停（保持静音）", fn: a.togglePause, keep: &a.pauseAction},
-		{text: "退出（恢复麦克风）", fn: a.quit},
-	} {
-		action := walk.NewAction()
-		if err = action.SetText(item.text); err != nil {
-			return err
-		}
-		action.Triggered().Attach(item.fn)
-		if err = a.tray.ContextMenu().Actions().Add(action); err != nil {
-			return err
-		}
-		if item.keep != nil {
-			*item.keep = action
-		}
-	}
-	return a.tray.SetVisible(true)
-}
-
-// disposeResources 在主窗口销毁前释放托盘与图标句柄。
+// disposeResources 释放本程序使用的主窗口图标。
 func (a *appWindow) disposeResources() {
-	if a.tray != nil {
-		_ = a.tray.Dispose()
+	if a.icon != nil {
+		a.icon.Dispose()
+		a.icon = nil
 	}
-	for _, icon := range a.icons {
-		icon.Dispose()
-	}
-}
-
-// showSettings 从托盘恢复主窗口，同时保留正在执行的按键控制。
-func (a *appWindow) showSettings() {
-	a.Show()
-	win.ShowWindow(a.Handle(), win.SW_RESTORE)
-	_ = a.Activate()
 }
 
 // showError 将实际操作失败同时写入日志和展示给用户。
@@ -287,19 +227,27 @@ func (a *appWindow) togglePause() {
 	}
 }
 
-// quit 等到音频线程解除静音后才真正退出，失败则保留界面供用户处理。
-func (a *appWindow) quit() {
+// restoreBeforeClose 让 X、Alt+F4、退出按钮和系统结束会话共用麦克风恢复逻辑。
+func (a *appWindow) restoreBeforeClose() error {
+	if a.closing {
+		return nil
+	}
+	a.finishHotkeyRecording(nil)
 	if a.engine != nil {
 		if err := a.engine.stop(); err != nil {
-			a.showError(fmt.Errorf("退出前恢复麦克风失败，请检查系统麦克风后重试：%w", err))
-			return
+			return err
 		}
 	}
 	a.closing = true
-	walk.App().Exit(0)
+	return nil
 }
 
-// updateStatus 在 UI 线程更新文字与托盘，音频控制不依赖此定时器。
+// quit 与标题栏关闭按钮采用相同的 WM_CLOSE 路径，恢复成功后由窗口结束消息循环。
+func (a *appWindow) quit() {
+	_ = a.Close()
+}
+
+// updateStatus 在 UI 线程更新状态文字，音频控制不依赖此定时器。
 func (a *appWindow) updateStatus() {
 	if a.engine == nil {
 		return
@@ -314,21 +262,21 @@ func (a *appWindow) updateStatus() {
 		a.deviceStamp = stamp.String()
 	}
 	keyName := hotkeyDisplayName(s.Config.Hotkey)
-	text, iconState := "已静音 · 按住 "+keyName+" 发言", "muted"
+	text := "已静音 · 按住 " + keyName + " 发言"
 	c := walk.RGB(174, 49, 60)
 	switch {
 	case s.Error != "":
-		text, iconState, c = "麦克风异常 · 请检查下方提示", "error", walk.RGB(173, 112, 20)
+		text, c = "麦克风异常 · 请检查下方提示", walk.RGB(173, 112, 20)
 	case !s.Ready:
-		text, iconState = "正在连接麦克风…", "pause"
+		text = "正在连接麦克风…"
 	case a.recording:
-		text, iconState = "正在录入快捷键 · 麦克风保持静音", "pause"
+		text = "正在录入快捷键 · 麦克风保持静音"
 	case s.Blocked:
-		text, iconState = "系统会话暂停 · 保持静音", "pause"
+		text = "系统会话暂停 · 保持静音"
 	case s.Paused:
-		text, iconState = "已暂停 · 麦克风保持静音", "pause"
+		text = "已暂停 · 麦克风保持静音"
 	case s.Speaking:
-		text, iconState, c = "正在发言 · 松开 "+keyName+" 静音", "speak", walk.RGB(22, 132, 78)
+		text, c = "正在发言 · 松开 "+keyName+" 静音", walk.RGB(22, 132, 78)
 	}
 	_ = a.statusLabel.SetText(text)
 	a.statusLabel.SetTextColor(c)
@@ -355,21 +303,11 @@ func (a *appWindow) updateStatus() {
 		pauseText = "恢复按键发言"
 	}
 	_ = a.pauseButton.SetText(pauseText)
-	if a.pauseAction != nil {
-		_ = a.pauseAction.SetText(pauseText)
-	}
-	if a.tray != nil {
-		_ = a.tray.SetToolTip("按键发言工具：" + text)
-		if a.iconState != iconState {
-			_ = a.tray.SetIcon(a.icons[iconState])
-			a.iconState = iconState
-		}
-	}
 }
 
 // safety 在收到锁屏、电源或关闭系统消息时，同步完成静音再返回 Windows。
 func (a *appWindow) safety(flag uint32, on bool) {
-	if a.engine != nil {
+	if a.engine != nil && !a.closing {
 		if err := a.engine.request(controlCommand{kind: "safety", flag: flag, on: on}); err != nil {
 			log.Printf("处理系统状态变化失败：%v", err)
 		}
@@ -409,7 +347,13 @@ func (a *appWindow) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 	case win.WM_ENDSESSION:
 		if wParam == 0 { // 用户取消了系统关闭，重新允许按键控制。
 			a.safety(blockShutdown, false)
+		} else {
+			// 系统关机或注销不会保证再发送 WM_CLOSE，须在此同步完成恢复。
+			if err := a.restoreBeforeClose(); err != nil {
+				log.Printf("系统结束会话时恢复麦克风失败：%v", err)
+			}
 		}
+		return 0
 	}
 	return a.MainWindow.WndProc(hwnd, msg, wParam, lParam)
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -41,6 +42,7 @@ type controller struct {
 	commands chan controlCommand      // 用户操作和系统安全事件队列。
 	done     chan struct{}            // 音频线程完成清理后关闭。
 	snapshot atomic.Pointer[Snapshot] // 供界面读取的最新状态。
+	exitErr  error                    // 音频线程清理的最终错误，只在 done 关闭后由其他线程读取。
 }
 
 // newController 启动控制循环；初始状态保持静音，等待用户完整按下一次快捷键。
@@ -76,12 +78,13 @@ func (c *controller) request(cmd controlCommand) error {
 func (c *controller) stop() error {
 	select {
 	case <-c.done:
-		return nil
+		return c.exitErr
 	default:
 	}
 	err := c.request(controlCommand{kind: "stop"})
 	if err == nil {
 		<-c.done
+		return c.exitErr
 	}
 	return err
 }
@@ -118,22 +121,58 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 	state := Snapshot{Config: cfg}
 	gains := make(gainSession)
 	var mic audioEndpoint
-	var normalExit bool // 正常退出已解除静音；异常退出时仍尽力静音，避免意外持续发言。
-	// 正常退出只释放接口，避免把刚恢复可用的麦克风再次静音。
-	defer func() {
-		if mic != nil {
-			if !normalExit {
-				if err := mic.setMute(true); err != nil {
-					log.Printf("异常退出时静音失败：%v", err)
-				}
-				if err := gains.restore(mic); err != nil {
-					log.Printf("异常退出时恢复麦克风音量失败：%v", err)
+	controlled := make(map[string]Device) // 本次运行接管过的设备，退出时一并解除静音。
+	var stopping bool                     // 关闭已开始后不再重新静音；恢复失败时只等待再次关闭重试。
+	var normalExit bool                   // 正常退出已完成恢复，避免清理时重复操作设备。
+	// restoreAll 尽力恢复所有已接管设备，音量恢复失败也继续尝试解除静音。
+	restoreAll := func() error {
+		var failures []error
+		for id, device := range controlled {
+			// 每次重试都重新打开稳定设备 ID，避免拔插后继续使用失效的旧接口。
+			target, openErr := audio.endpoint(id)
+			opened := openErr == nil
+			if openErr != nil {
+				if mic != nil && mic.info().ID == id {
+					target = mic // 枚举暂时失败时仍尝试已持有的接口。
+				} else {
+					log.Printf("退出时设备 %s 不可用，无法恢复：%v", device.Name, openErr)
+					continue
 				}
 			}
+			if err := gains.restore(target); err != nil && !endpointGone(err) {
+				failures = append(failures, fmt.Errorf("恢复 %s 音量失败：%w", device.Name, err))
+			}
+			if err := target.setMute(false); err != nil {
+				if !endpointGone(err) {
+					failures = append(failures, fmt.Errorf("解除 %s 静音失败：%w", device.Name, err))
+				}
+			} else if muted, err := target.muted(); err != nil {
+				if !endpointGone(err) {
+					failures = append(failures, fmt.Errorf("确认 %s 静音状态失败：%w", device.Name, err))
+				}
+			} else if muted {
+				failures = append(failures, fmt.Errorf("%s 仍处于静音状态，请检查设备后重试", device.Name))
+			}
+			if opened {
+				target.close()
+			}
+		}
+		return errors.Join(failures...)
+	}
+	// 正常退出只释放接口，避免把刚恢复可用的麦克风再次静音。
+	defer func() {
+		recovered := recover()
+		if !normalExit {
+			c.exitErr = restoreAll()
+			if c.exitErr != nil {
+				log.Printf("控制线程结束时恢复麦克风失败：%v", c.exitErr)
+			}
+		}
+		if mic != nil {
 			mic.close()
 		}
 		gains.logUnrestored()
-		if recovered := recover(); recovered != nil {
+		if recovered != nil {
 			state.Speaking, state.Ready = false, false
 			state.Error = fmt.Sprintf("控制线程异常：%v，请重启程序并检查系统静音状态", recovered)
 			c.snapshot.Store(&state)
@@ -173,6 +212,10 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 	for {
 		select {
 		case cmd := <-c.commands:
+			if stopping && cmd.kind != "stop" {
+				cmd.reply <- fmt.Errorf("正在恢复麦克风，请检查设备后再次关闭窗口")
+				continue
+			}
 			var cmdErr error
 			switch cmd.kind {
 			case "apply":
@@ -204,22 +247,14 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 				}
 				state.Blocked = blockFlags != 0
 			case "stop":
-				if mic != nil {
-					cmdErr = gains.restore(mic)
-					if cmdErr == nil || endpointGone(cmdErr) {
-						cmdErr = mic.setMute(false)
-					}
-					if endpointGone(cmdErr) {
-						cmdErr = nil // 系统已确认端点失效，释放旧接口后即可退出。
-					}
-				}
+				stopping = true
+				cmdErr = restoreAll()
 				if cmdErr != nil {
-					fail(cmdErr)
+					state.Error, state.Speaking = cmdErr.Error(), false
 					publish()
 					cmd.reply <- cmdErr
 					continue // 恢复失败时保持程序运行，让用户看到错误并重试。
 				}
-				_ = gains.restoreOthers(audio, mic)
 				normalExit = true
 				cmd.reply <- nil
 				return
@@ -236,6 +271,9 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 			publish()
 			cmd.reply <- cmdErr
 		case <-ticker.C:
+			if stopping {
+				continue // 恢复失败也不能把已经解除静音的设备再次静音。
+			}
 			now := time.Now()
 			if !lastTick.IsZero() && now.Sub(lastTick) > 250*time.Millisecond {
 				gate.armed = false // 休眠或长时间停顿后必须重新松键，再按下才开麦。
@@ -269,6 +307,7 @@ func (c *controller) control(cfg Config, audio audioBackend, readKeys func(Hotke
 						mic.close()
 					}
 					mic = candidate
+					controlled[mic.info().ID] = mic.info()
 					gate.armed = false
 					if muteErr := mic.setMute(true); muteErr != nil {
 						fail(muteErr)
